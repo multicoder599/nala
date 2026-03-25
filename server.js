@@ -36,7 +36,8 @@ function auth(req, res, next) {
   const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ message: 'No token – please sign in.' });
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    // Added fallback secret to prevent crashes if .env is missing
+    req.user = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_nala_key');
     next();
   } catch {
     return res.status(401).json({ message: 'Token expired or invalid – please sign in again.' });
@@ -45,19 +46,13 @@ function auth(req, res, next) {
 
 /**
  * Protect admin-only routes.
- * Admin credentials live in .env:
- * ADMIN_USERNAME=admin
- * ADMIN_PASSWORD=your_strong_password
- *
- * The admin logs in via POST /api/admin/login which returns a
- * short-lived admin JWT signed with ADMIN_JWT_SECRET.
  */
 function adminAuth(req, res, next) {
   const header = req.headers['authorization'] || '';
   const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ message: 'Admin token required.' });
   try {
-    const decoded = jwt.verify(token, process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET + '_admin');
+    const decoded = jwt.verify(token, process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET || 'super_secret_nala_key_admin');
     if (decoded.role !== 'admin') throw new Error('Not admin');
     req.admin = decoded;
     next();
@@ -79,10 +74,6 @@ function genRef() {
 
 /**
  * ATOMIC transaction engine.
- * – Validates the account exists and (for debits) has enough balance.
- * – Updates balance with $inc to avoid race conditions.
- * – Writes the Transaction document.
- * Returns the updated Account.
  */
 async function recordTransaction(accountId, type, amount, description, meta = {}) {
   const CREDIT_TYPES = ['credit', 'deposit', 'received', 'airtime_received', 'savings_interest', 'admin_credit'];
@@ -106,15 +97,10 @@ async function recordTransaction(accountId, type, amount, description, meta = {}
   );
   if (!updated) throw new Error('Account not found');
 
-  // ── Resolve senderId / receiverId ───────────────────────────
-  // These are required by the live Transaction schema.
-  // senderId  = account initiating the transaction
-  // receiverId = account receiving the funds
   const counterparty = meta.counterpartyAccountId || null;
   const senderId   = isCredit ? (counterparty || accountId) : accountId;
   const receiverId = isCredit ? accountId : (counterparty || accountId);
 
-  // Remove helper key before spreading into Transaction.create()
   const { counterpartyAccountId: _drop, ...cleanMeta } = meta;
 
   await Transaction.create({
@@ -150,9 +136,9 @@ app.post('/api/register', async (req, res) => {
     if (!fullName || !phone || !password)
       return res.status(400).json({ message: 'Full name, phone and password are required.' });
 
-    // Clean username
+    // Clean username safely
     let username = rawUsername
-      ? rawUsername.toLowerCase().replace(/[^a-z0-9_]/g, '')
+      ? String(rawUsername).toLowerCase().replace(/[^a-z0-9_]/g, '')
       : (() => {
           const parts = fullName.toLowerCase().split(' ');
           const base  = parts.length > 1 ? parts[0][0] + parts[parts.length - 1] : parts[0];
@@ -171,16 +157,18 @@ app.post('/api/register', async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    const newUser = await User.create({
-      fullName, username, email: email || '', phone, password: hashedPassword
-    });
+    // Prevent empty string duplicate key error in MongoDB by only adding email if it exists
+    const userData = { fullName, username, phone, password: hashedPassword };
+    if (email && email.trim() !== '') userData.email = email.trim();
+
+    const newUser = await User.create(userData);
 
     const accountNumber = '0123' + Math.floor(10000000 + Math.random() * 90000000);
     const newAccount = await Account.create({
       userId: newUser._id, accountNumber, balance: 0
     });
 
-    const token = jwt.sign({ id: newUser._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: newUser._id }, process.env.JWT_SECRET || 'super_secret_nala_key', { expiresIn: '7d' });
 
     res.status(201).json({
       message: 'Account created successfully',
@@ -201,17 +189,26 @@ app.post('/api/login', async (req, res) => {
     if (!username || !password)
       return res.status(400).json({ message: 'Username and password are required.' });
 
-    const user = await User.findOne({ username: username.toLowerCase().trim() });
-    if (!user) return res.status(400).json({ message: 'Invalid username or password.' });
+    const searchStr = String(username).toLowerCase().trim();
+    
+    // Check username, email, OR phone so users don't get locked out
+    const user = await User.findOne({ 
+      $or: [
+        { username: searchStr }, 
+        { email: searchStr },
+        { phone: username.trim() }
+      ] 
+    });
+    
+    if (!user) return res.status(400).json({ message: 'Invalid credentials.' });
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Invalid username or password.' });
+    if (!isMatch) return res.status(400).json({ message: 'Invalid credentials.' });
 
-    // Check if suspended
     if (user.status === 'suspended')
       return res.status(403).json({ message: 'Your account has been suspended. Contact support.' });
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'super_secret_nala_key', { expiresIn: '7d' });
 
     res.json({
       message: 'Login successful', token,
@@ -274,10 +271,10 @@ app.post('/api/user/lookup', auth, async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Phone number is required.' });
 
-    // 1. Clean the input (remove spaces, dashes, etc.)
+    // Clean the input (remove spaces, dashes, etc.)
     const cleanPhone = phone.trim().replace(/[\s-]/g, '');
 
-    // 2. Extract the core 9 digits (e.g., 712345678 or 112345678)
+    // Extract the core 9 digits (e.g., 712345678)
     let corePhone = cleanPhone;
     if (corePhone.startsWith('+254')) {
         corePhone = corePhone.slice(4);
@@ -287,22 +284,21 @@ app.post('/api/user/lookup', auth, async (req, res) => {
         corePhone = corePhone.slice(1);
     }
 
-    // 3. Create an array of all possible formats the DB might hold
+    // Create an array of all possible formats the DB might hold
     const possiblePhones = [
         `0${corePhone}`,      // e.g., 0712345678
         `254${corePhone}`,    // e.g., 254712345678
         `+254${corePhone}`,   // e.g., +254712345678
-        cleanPhone            // Fallback for exact match of whatever was typed
+        cleanPhone            // Fallback for exact match
     ];
 
-    // 4. Query the database using the $in operator
     const user = await User.findOne({ 
         phone: { $in: possiblePhones } 
     }).select('fullName username phone');
 
     if (!user) return res.status(404).json({ message: 'User not found or registered to Nala.' });
 
-    // 5. Prevent transferring to self
+    // Prevent transferring to self
     if (user._id.toString() === req.user.id) {
       return res.status(400).json({ message: 'You cannot transfer money to yourself.' });
     }
@@ -576,6 +572,7 @@ app.post('/api/card/unfreeze', auth, async (req, res) => {
     const account = await Account.findOneAndUpdate(
       { userId: req.user.id }, { cardFrozen: false }, { new: true }
     );
+    if (!account) return res.status(404).json({ message: 'Account not found.' });
     res.json({ message: 'Card unfrozen.', frozen: false });
   } catch (err) { res.status(500).json({ message: 'Could not unfreeze card.' }); }
 });
@@ -645,7 +642,7 @@ app.post('/api/admin/login', async (req, res) => {
 
     const token = jwt.sign(
       { role: 'admin', username },
-      process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET + '_admin',
+      process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET || 'super_secret_nala_key_admin',
       { expiresIn: '8h' }
     );
 
