@@ -274,10 +274,35 @@ app.post('/api/user/lookup', auth, async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Phone number is required.' });
 
-    const user = await User.findOne({ phone: phone.trim() }).select('fullName username phone');
+    // 1. Clean the input (remove spaces, dashes, etc.)
+    const cleanPhone = phone.trim().replace(/[\s-]/g, '');
+
+    // 2. Extract the core 9 digits (e.g., 712345678 or 112345678)
+    let corePhone = cleanPhone;
+    if (corePhone.startsWith('+254')) {
+        corePhone = corePhone.slice(4);
+    } else if (corePhone.startsWith('254')) {
+        corePhone = corePhone.slice(3);
+    } else if (corePhone.startsWith('0')) {
+        corePhone = corePhone.slice(1);
+    }
+
+    // 3. Create an array of all possible formats the DB might hold
+    const possiblePhones = [
+        `0${corePhone}`,      // e.g., 0712345678
+        `254${corePhone}`,    // e.g., 254712345678
+        `+254${corePhone}`,   // e.g., +254712345678
+        cleanPhone            // Fallback for exact match of whatever was typed
+    ];
+
+    // 4. Query the database using the $in operator
+    const user = await User.findOne({ 
+        phone: { $in: possiblePhones } 
+    }).select('fullName username phone');
+
     if (!user) return res.status(404).json({ message: 'User not found or registered to Nala.' });
 
-    // Prevent transferring to self
+    // 5. Prevent transferring to self
     if (user._id.toString() === req.user.id) {
       return res.status(400).json({ message: 'You cannot transfer money to yourself.' });
     }
