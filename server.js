@@ -46,8 +46,8 @@ function auth(req, res, next) {
 /**
  * Protect admin-only routes.
  * Admin credentials live in .env:
- *   ADMIN_USERNAME=admin
- *   ADMIN_PASSWORD=your_strong_password
+ * ADMIN_USERNAME=admin
+ * ADMIN_PASSWORD=your_strong_password
  *
  * The admin logs in via POST /api/admin/login which returns a
  * short-lived admin JWT signed with ADMIN_JWT_SECRET.
@@ -264,6 +264,28 @@ app.get('/api/transactions', auth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Could not fetch transactions.' });
+  }
+});
+
+
+// ── USER LOOKUP (For P2P Transfer Verification) ──────────────
+app.post('/api/user/lookup', auth, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Phone number is required.' });
+
+    const user = await User.findOne({ phone: phone.trim() }).select('fullName username phone');
+    if (!user) return res.status(404).json({ message: 'User not found or registered to Nala.' });
+
+    // Prevent transferring to self
+    if (user._id.toString() === req.user.id) {
+      return res.status(400).json({ message: 'You cannot transfer money to yourself.' });
+    }
+
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error('User lookup error:', err);
+    res.status(500).json({ message: 'Server error during user verification.' });
   }
 });
 
