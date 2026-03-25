@@ -86,11 +86,11 @@ function genRef() {
  */
 async function recordTransaction(accountId, type, amount, description, meta = {}) {
   const CREDIT_TYPES = ['credit', 'deposit', 'received', 'airtime_received', 'savings_interest', 'admin_credit'];
-  const isCredit     = CREDIT_TYPES.includes(type);
-  const absAmount    = Math.abs(amount);
-  const sign         = isCredit ? 1 : -1;
+  const isCredit  = CREDIT_TYPES.includes(type);
+  const absAmount = Math.abs(amount);
+  const sign      = isCredit ? 1 : -1;
 
-  // For debits — check balance first (read-modify-write inside MongoDB)
+  // For debits — check balance BEFORE touching anything
   if (!isCredit) {
     const current = await Account.findById(accountId);
     if (!current) throw new Error('Account not found');
@@ -106,15 +106,27 @@ async function recordTransaction(accountId, type, amount, description, meta = {}
   );
   if (!updated) throw new Error('Account not found');
 
-  // Record the transaction
+  // ── Resolve senderId / receiverId ───────────────────────────
+  // These are required by the live Transaction schema.
+  // senderId  = account initiating the transaction
+  // receiverId = account receiving the funds
+  const counterparty = meta.counterpartyAccountId || null;
+  const senderId   = isCredit ? (counterparty || accountId) : accountId;
+  const receiverId = isCredit ? accountId : (counterparty || accountId);
+
+  // Remove helper key before spreading into Transaction.create()
+  const { counterpartyAccountId: _drop, ...cleanMeta } = meta;
+
   await Transaction.create({
     accountId,
     type,
-    amount:      sign * absAmount,   // stored as negative for debits
+    amount:       sign * absAmount,
     description,
-    reference:   meta.reference || genRef(),
-    balanceAfter: updated.balance,   // snapshot for audit trail
-    ...meta
+    reference:    cleanMeta.reference || genRef(),
+    balanceAfter: updated.balance,
+    senderId,
+    receiverId,
+    ...cleanMeta
   });
 
   return updated;
@@ -272,21 +284,23 @@ app.post('/api/transfer', auth, async (req, res) => {
     const reference = genRef();
     const desc      = note || `Transfer to @${recipient}`;
 
-    // ── Debit sender (throws if insufficient) ──
-    const updatedSender = await recordTransaction(
-      senderAcc._id, 'debit', parsedAmount, desc,
-      { recipient, reference }
-    );
-
-    // ── Credit recipient if internal account exists ──
+    // ── Resolve recipient account (internal transfer) ──
     const recipUser = await User.findOne({ username: recipient.toLowerCase().trim() });
     const recipAcc  = recipUser ? await Account.findOne({ userId: recipUser._id }) : null;
 
+    // ── Debit sender (throws on insufficient balance) ──
+    // Pass counterpartyAccountId so senderId/receiverId are set correctly
+    const updatedSender = await recordTransaction(
+      senderAcc._id, 'debit', parsedAmount, desc,
+      { recipient, reference, counterpartyAccountId: recipAcc ? recipAcc._id : senderAcc._id }
+    );
+
+    // ── Credit recipient if internal account exists ──
     if (recipAcc) {
       await recordTransaction(
         recipAcc._id, 'credit', parsedAmount,
         `Transfer from @${senderUser.username}`,
-        { sender: senderUser.username, reference }
+        { sender: senderUser.username, reference, counterpartyAccountId: senderAcc._id }
       );
     }
 
@@ -319,7 +333,8 @@ app.post('/api/mpesa', auth, async (req, res) => {
       ? `M-Pesa deposit from ${phone}`
       : `M-Pesa withdrawal to ${phone}`;
 
-    const updated = await recordTransaction(account._id, txType, parsedAmount, desc, { phone });
+    const updated = await recordTransaction(account._id, txType, parsedAmount, desc,
+      { phone, counterpartyAccountId: account._id });
 
     res.json({
       message:    `M-Pesa ${type} of KES ${parsedAmount.toFixed(2)} processed.`,
@@ -348,7 +363,7 @@ app.post('/api/airtime', auth, async (req, res) => {
     const updated = await recordTransaction(
       account._id, 'debit', parsedAmount,
       `${network || 'Airtime'} purchase for ${phone}`,
-      { phone, network }
+      { phone, network, counterpartyAccountId: account._id }
     );
 
     res.json({
@@ -378,7 +393,7 @@ app.post('/api/bills/pay', auth, async (req, res) => {
     const updated = await recordTransaction(
       account._id, 'debit', parsedAmount,
       `${biller} – A/C ${billAccount}`,
-      { biller, billAccount }
+      { biller, billAccount, counterpartyAccountId: account._id }
     );
 
     res.json({
@@ -409,7 +424,7 @@ app.post('/api/savings/deposit', auth, async (req, res) => {
     const updated = await recordTransaction(
       account._id, 'debit', parsedAmount,
       'Smart Savings deposit',
-      { category: 'savings' }
+      { category: 'savings', counterpartyAccountId: account._id }
     );
 
     // Increment savings sub-balance
@@ -782,7 +797,7 @@ app.post('/api/admin/accounts/:id/credit', adminAuth, async (req, res) => {
     const updated = await recordTransaction(
       req.params.id, 'admin_credit', parseFloat(amount),
       description || 'Admin credit',
-      { adminUser: req.admin.username }
+      { adminUser: req.admin.username, counterpartyAccountId: req.params.id }
     );
 
     console.log(`💰 Admin credited KES ${amount} to account ${req.params.id}`);
@@ -802,7 +817,7 @@ app.post('/api/admin/accounts/:id/debit', adminAuth, async (req, res) => {
     const updated = await recordTransaction(
       req.params.id, 'debit', parseFloat(amount),
       description || 'Admin debit',
-      { adminUser: req.admin.username }
+      { adminUser: req.admin.username, counterpartyAccountId: req.params.id }
     );
 
     console.log(`🔻 Admin debited KES ${amount} from account ${req.params.id}`);
